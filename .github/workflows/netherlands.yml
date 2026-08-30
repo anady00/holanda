@@ -1,1 +1,133 @@
+name: Netherlands Appointment Monitor
 
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: netherlands-appointment-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 14
+
+    steps:
+
+      # ==========================================
+      # 1. تحميل Repository
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+
+      # ==========================================
+      # 2. إعداد Python
+      # ==========================================
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+
+      # ==========================================
+      # 3. تثبيت Playwright
+      # ==========================================
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+
+      # ==========================================
+      # 4. تشغيل Netherlands Monitor
+      # ==========================================
+      - name: Run Netherlands monitor
+        env:
+
+          # ----------------------------------------
+          # VFS URL
+          # ----------------------------------------
+          NL_APPOINTMENT_URL: ${{ secrets.NL_APPOINTMENT_URL }}
+
+          # ----------------------------------------
+          # Gmail
+          # ----------------------------------------
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+
+          # ----------------------------------------
+          # Monitor settings
+          # ----------------------------------------
+          APPLICANTS: "1"
+
+          CATEGORY_DELAY_SECONDS: "1.5"
+
+          PAGE_TIMEOUT_MS: "60000"
+
+          HEADLESS: "true"
+
+          DEBUG: "1"
+
+          ARTIFACT_DIR: "debug"
+
+          STATE_FILE: "state.json"
+
+        run: |
+          python netherlands_monitor.py --once
+
+
+      # ==========================================
+      # 5. رفع Screenshots و HTML عند الخطأ
+      # ==========================================
+      - name: Upload debug artifacts
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: netherlands-monitor-debug-${{ github.run_id }}
+
+          path: |
+            debug/
+            state.json
+
+          if-no-files-found: ignore
+
+          retention-days: 7
+
+
+      # ==========================================
+      # 6. حفظ state.json في GitHub
+      # ==========================================
+      - name: Commit state
+        if: success()
+
+        run: |
+
+          if [ -f state.json ]; then
+
+            git config user.name "github-actions[bot]"
+
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add state.json
+
+            git diff --cached --quiet || \
+              git commit -m "Update Netherlands monitor state"
+
+            git push || true
+
+          fi
