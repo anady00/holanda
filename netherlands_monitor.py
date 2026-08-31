@@ -1,34 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-Netherlands VFS appointment monitor.
-
-- Opens the Netherlands appointment scheduling URL.
-- Discovers all Application Categories automatically.
-- Checks every category independently.
-- Detects the "no slots available" message.
-- Detects possible appointment availability.
-- Sends an email only when availability is detected.
-- Does NOT book appointments automatically.
-- Saves screenshots/HTML when an unexpected state or error occurs.
-
-Required GitHub Secrets:
-    NL_APPOINTMENT_URL
-    GMAIL_USER
-    GMAIL_APP_PASSWORD
-    NOTIFY_EMAIL
-
-Optional environment variables:
-    APPLICANTS=1
-    POLL_SECONDS=300
-    CATEGORY_DELAY_SECONDS=2
-    PAGE_TIMEOUT_MS=60000
-    HEADLESS=true
-    DEBUG=1
-    ARTIFACT_DIR=debug
-    STATE_FILE=state.json
-"""
-
 import json
 import os
 import re
@@ -39,124 +10,192 @@ import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from playwright.sync_api import (
-    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
 )
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-BASE_URL = os.environ.get("NL_APPOINTMENT_URL", "").strip()
+URL = os.getenv("NL_APPOINTMENT_URL", "").strip()
 
-APPLICANTS = os.environ.get("APPLICANTS", "1").strip()
+APPLICANTS = os.getenv("APPLICANTS", "1").strip()
 
-POLL_SECONDS = int(
-    os.environ.get("POLL_SECONDS", "300")
+PAGE_TIMEOUT = int(
+    os.getenv("PAGE_TIMEOUT_MS", "60000")
 )
 
-CATEGORY_DELAY_SECONDS = float(
-    os.environ.get("CATEGORY_DELAY_SECONDS", "2")
+CATEGORY_DELAY = float(
+    os.getenv("CATEGORY_DELAY_SECONDS", "2")
 )
 
-PAGE_TIMEOUT_MS = int(
-    os.environ.get("PAGE_TIMEOUT_MS", "60000")
-)
+HEADLESS = os.getenv(
+    "HEADLESS",
+    "true"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
-HEADLESS = (
-    os.environ.get("HEADLESS", "true").lower()
-    not in {"0", "false", "no"}
-)
+DEBUG = os.getenv(
+    "DEBUG",
+    "1"
+).lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
-DEBUG = (
-    os.environ.get("DEBUG", "0").lower()
-    in {"1", "true", "yes"}
-)
-
-ARTIFACT_DIR = Path(
-    os.environ.get("ARTIFACT_DIR", "debug")
+DEBUG_DIR = Path(
+    os.getenv("ARTIFACT_DIR", "debug")
 )
 
 STATE_FILE = Path(
-    os.environ.get("STATE_FILE", "state.json")
+    os.getenv("STATE_FILE", "state.json")
 )
 
 
 # ============================================================
-# TEXT PATTERNS
+# TEXT
 # ============================================================
 
-NO_SLOT_PATTERNS = [
-    r"there are currently no slots available",
-    r"no slots available",
-    r"no appointments available",
-    r"no appointment slots",
-    r"not possible to make an appointment at this time",
+NO_SLOT_TEXT = [
+    "there are currently no slots available",
+    "no slots available",
+    "no appointments available",
+    "no appointment slots",
+    "not possible to make an appointment at this time",
+]
+
+AVAILABLE_TEXT = [
+    "select a date",
+    "choose a date",
+    "appointment date",
+    "available appointments",
+    "available time",
+    "select a time",
+    "choose a time",
+    "appointment time",
 ]
 
 
-POSITIVE_PATTERNS = [
-    r"select (?:a|an) date",
-    r"choose (?:a|an) date",
-    r"appointment date",
-    r"available appointments",
-    r"available time",
-    r"select a time",
-    r"choose a time",
-    r"appointment time",
-    r"calendar",
-]
-
-
-CATEGORY_HINTS = (
-    "passport",
-    "identity",
-    "legalisation",
-    "legalization",
-    "mvv",
-    "certificate",
-    "copy conform",
-    "signature",
-)
-
-
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def timestamp():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-def safe_name(value: str) -> str:
-    value = re.sub(r"\s+", " ", value).strip()
-
-    value = re.sub(
-        r"[^A-Za-z0-9._-]+",
-        "_",
-        value
-    )
-
-    return value[:120] or "unknown"
-
-
-def normalize(text: str) -> str:
+def normalize(text):
     return re.sub(
         r"\s+",
         " ",
-        text or ""
-    ).strip().lower()
+        str(text or "")
+    ).strip()
 
 
-def load_state() -> Dict:
+def lower(text):
+    return normalize(text).lower()
+
+
+def safe_filename(text):
+    text = normalize(text)
+
+    text = re.sub(
+        r"[^a-zA-Z0-9_-]+",
+        "_",
+        text
+    )
+
+    return text[:100] or "unknown"
+
+
+def save_debug(page, name):
+    DEBUG_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    stamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    filename = (
+        f"{stamp}_{safe_filename(name)}"
+    )
+
+    png = DEBUG_DIR / (
+        filename + ".png"
+    )
+
+    html = DEBUG_DIR / (
+        filename + ".html"
+    )
+
+    try:
+        page.screenshot(
+            path=str(png),
+            full_page=True
+        )
+    except Exception as e:
+        print(
+            f"[debug] screenshot error: {e}"
+        )
+
+    try:
+        html.write_text(
+            page.content(),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        print(
+            f"[debug] html error: {e}"
+        )
+
+    print(
+        f"[debug] saved: {png}"
+    )
+
+    print(
+        f"[debug] saved: {html}"
+    )
+
+    return png, html
+
+
+def get_body_text(page):
+    try:
+        return normalize(
+            page.locator(
+                "body"
+            ).inner_text(
+                timeout=10000
+            )
+        )
+    except Exception:
+        return normalize(
+            page.content()
+        )
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def load_state():
+
     if not STATE_FILE.exists():
         return {
             "categories": {},
-            "last_run": None
+            "last_run": None,
         }
 
     try:
@@ -165,15 +204,15 @@ def load_state() -> Dict:
                 encoding="utf-8"
             )
         )
-
     except Exception:
         return {
             "categories": {},
-            "last_run": None
+            "last_run": None,
         }
 
 
-def save_state(state: Dict) -> None:
+def save_state(state):
+
     STATE_FILE.write_text(
         json.dumps(
             state,
@@ -185,250 +224,272 @@ def save_state(state: Dict) -> None:
 
 
 # ============================================================
-# DEBUG / ARTIFACTS
+# PAGE LOADING
 # ============================================================
 
-def save_debug(
-    page,
-    prefix: str,
-    category: str = ""
-) -> Tuple[Path, Path]:
+def wait_page(page):
 
-    ARTIFACT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=30000
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    try:
+        page.wait_for_load_state(
+            "networkidle",
+            timeout=15000
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    page.wait_for_timeout(
+        1500
     )
 
-    stamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
+
+# ============================================================
+# OPEN START PAGE
+# ============================================================
+
+def open_start_page(page):
+
+    print(
+        "[info] Opening Netherlands VFS..."
     )
 
-    stem = (
-        f"{stamp}_"
-        f"{safe_name(prefix)}_"
-        f"{safe_name(category)}"
-    ).strip("_")
+    page.goto(
+        URL,
+        wait_until="domcontentloaded",
+        timeout=PAGE_TIMEOUT
+    )
 
-    png = ARTIFACT_DIR / f"{stem}.png"
+    wait_page(page)
 
-    html = ARTIFACT_DIR / f"{stem}.html"
+    print(
+        "[info] Current URL:",
+        page.url
+    )
 
-    try:
-        page.screenshot(
-            path=str(png),
-            full_page=True
+    if DEBUG:
+        save_debug(
+            page,
+            "01_welcome"
         )
 
-    except Exception as exc:
-        print(
-            f"[warn] screenshot failed: {exc}",
-            flush=True
-        )
 
-    try:
-        html.write_text(
-            page.content(),
-            encoding="utf-8"
-        )
+# ============================================================
+# CLICK MAKE APPOINTMENT
+# ============================================================
 
-    except Exception as exc:
-        print(
-            f"[warn] HTML save failed: {exc}",
-            flush=True
-        )
+def click_make_appointment(page):
 
-    return png, html
+    print(
+        "[info] Looking for "
+        "'Make an appointment'..."
+    )
 
+    # Exact visible text
+    candidates = [
+        page.get_by_text(
+            "Make an appointment",
+            exact=True
+        ),
 
-def page_text(page) -> str:
-
-    try:
-        return normalize(
-            page.locator("body").inner_text(
-                timeout=5000
+        page.get_by_role(
+            "link",
+            name=re.compile(
+                r"make an appointment",
+                re.I
             )
-        )
+        ),
 
-    except Exception:
-        return normalize(
-            page.content()
-        )
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"make an appointment",
+                re.I
+            )
+        ),
+    ]
 
-
-# ============================================================
-# FIND APPLICATION CATEGORY DROPDOWN
-# ============================================================
-
-def find_category_select(page):
-
-    """
-    Find Application Category <select>
-    without depending on unstable ASP.NET IDs.
-    """
-
-    selects = page.locator(
-        "select:visible"
-    )
-
-    count = selects.count()
-
-    candidates = []
-
-    for i in range(count):
-
-        sel = selects.nth(i)
+    for locator in candidates:
 
         try:
 
-            options = sel.locator("option")
+            count = locator.count()
 
-            texts = [
-                normalize(
-                    options.nth(j).inner_text()
+            if count == 0:
+                continue
+
+            for i in range(count):
+
+                element = locator.nth(i)
+
+                if not element.is_visible():
+                    continue
+
+                print(
+                    "[info] Clicking "
+                    "'Make an appointment'"
                 )
-                for j in range(options.count())
-            ]
 
-            joined = " | ".join(texts)
+                element.click(
+                    timeout=15000
+                )
 
-            score = sum(
-                1
-                for hint in CATEGORY_HINTS
-                if hint in joined
+                wait_page(page)
+
+                print(
+                    "[info] After click URL:",
+                    page.url
+                )
+
+                if DEBUG:
+                    save_debug(
+                        page,
+                        "02_after_make_appointment"
+                    )
+
+                return True
+
+        except Exception as e:
+
+            print(
+                "[debug] click attempt failed:",
+                e
             )
 
-            if score:
-                candidates.append(
-                    (
-                        score,
-                        i,
-                        texts
-                    )
+    # --------------------------------------------------------
+    # Fallback: search all links/buttons by text
+    # --------------------------------------------------------
+
+    elements = page.locator(
+        "a, button, input"
+    )
+
+    for i in range(
+        elements.count()
+    ):
+
+        element = elements.nth(i)
+
+        try:
+
+            if not element.is_visible():
+                continue
+
+            text = lower(
+                element.inner_text()
+                or element.get_attribute(
+                    "value"
                 )
+                or element.get_attribute(
+                    "aria-label"
+                )
+            )
+
+            if (
+                "make an appointment"
+                in text
+            ):
+
+                print(
+                    "[info] Found fallback "
+                    "appointment button"
+                )
+
+                element.click(
+                    timeout=15000
+                )
+
+                wait_page(page)
+
+                return True
 
         except Exception:
             continue
 
-    if not candidates:
-        raise RuntimeError(
-            "Could not find the Application Category dropdown."
-        )
-
-    candidates.sort(
-        reverse=True
+    save_debug(
+        page,
+        "ERROR_make_appointment_not_found"
     )
 
-    return selects.nth(
-        candidates[0][1]
+    raise RuntimeError(
+        "Could not find 'Make an appointment'."
     )
 
 
 # ============================================================
-# DISCOVER ALL CATEGORIES
+# FIND APPLICANT FIELD
 # ============================================================
 
-def discover_categories(page) -> List[Dict[str, str]]:
+def set_applicants(page):
 
-    sel = find_category_select(page)
+    print(
+        f"[info] Setting applicants = {APPLICANTS}"
+    )
 
-    options = sel.locator("option")
-
-    categories = []
-
-    for i in range(options.count()):
-
-        opt = options.nth(i)
-
-        text = opt.inner_text().strip()
-
-        value = (
-            opt.get_attribute("value")
-            or ""
-        )
-
-        disabled = opt.is_disabled()
-
-        if not text or disabled:
-            continue
-
-        # Skip placeholder
-        if normalize(text) in {
-            "-select-",
-            "select",
-            "--select--",
-            "- select -",
-        }:
-            continue
-
-        categories.append(
-            {
-                "text": text,
-                "value": value,
-            }
-        )
-
-    # Remove duplicates
-    seen = set()
-
-    result = []
-
-    for item in categories:
-
-        key = (
-            item["text"],
-            item["value"]
-        )
-
-        if key not in seen:
-
-            seen.add(key)
-
-            result.append(item)
-
-    if not result:
-
-        raise RuntimeError(
-            "Application Category dropdown was found, "
-            "but no usable options were discovered."
-        )
-
-    return result
-
-
-# ============================================================
-# APPLICANT COUNT
-# ============================================================
-
-def set_applicants(page) -> None:
-
-    """
-    The screenshot shows a normal text input
-    containing the number of applicants.
-    """
-
+    # Inputs
     inputs = page.locator(
         "input:visible"
     )
 
-    for i in range(inputs.count()):
+    for i in range(
+        inputs.count()
+    ):
 
-        inp = inputs.nth(i)
+        element = inputs.nth(i)
 
         try:
 
-            typ = (
-                inp.get_attribute("type")
-                or "text"
-            ).lower()
+            typ = lower(
+                element.get_attribute(
+                    "type"
+                )
+            )
 
-            value = (
-                inp.input_value()
-                or ""
-            ).strip()
+            if typ not in {
+                "",
+                "text",
+                "number",
+            }:
+                continue
+
+            name = lower(
+                element.get_attribute(
+                    "name"
+                )
+            )
+
+            element_id = lower(
+                element.get_attribute(
+                    "id"
+                )
+            )
+
+            placeholder = lower(
+                element.get_attribute(
+                    "placeholder"
+                )
+            )
+
+            value = normalize(
+                element.input_value()
+            )
+
+            combined = " ".join([
+                name,
+                element_id,
+                placeholder,
+                value,
+            ])
 
             if (
-                typ in {"text", "number"}
-                and value in {
+                "applicant" in combined
+                or value in {
                     "",
                     "1",
                     "2",
@@ -438,7 +499,7 @@ def set_applicants(page) -> None:
                 }
             ):
 
-                inp.fill(
+                element.fill(
                     APPLICANTS
                 )
 
@@ -447,27 +508,29 @@ def set_applicants(page) -> None:
         except Exception:
             continue
 
-    # Fallback if applicants is a select
+    # Select fallback
     selects = page.locator(
         "select:visible"
     )
 
-    for i in range(selects.count()):
+    for i in range(
+        selects.count()
+    ):
 
-        sel = selects.nth(i)
+        select = selects.nth(i)
 
         try:
 
-            texts = [
+            options = [
                 normalize(x)
-                for x in sel
-                .locator("option")
-                .all_inner_texts()
+                for x in select.locator(
+                    "option"
+                ).all_inner_texts()
             ]
 
-            if APPLICANTS in texts:
+            if APPLICANTS in options:
 
-                sel.select_option(
+                select.select_option(
                     label=APPLICANTS
                 )
 
@@ -477,23 +540,271 @@ def set_applicants(page) -> None:
             continue
 
     print(
-        "[warn] Applicant count field "
-        "was not identified; "
-        "leaving site default.",
-        flush=True
+        "[warn] Applicant field not found; "
+        "site default will be used."
     )
 
 
 # ============================================================
-# CLICK CONTINUE
+# DISCOVER APPLICATION CATEGORY
 # ============================================================
 
-def click_continue(page) -> None:
+def find_category_controls(page):
 
-    """
-    Finds Continue without relying on
-    unstable ASP.NET control IDs.
-    """
+    print(
+        "[info] Searching for "
+        "Application Category..."
+    )
+
+    # First try normal <select>
+    selects = page.locator(
+        "select:visible"
+    )
+
+    for i in range(
+        selects.count()
+    ):
+
+        select = selects.nth(i)
+
+        try:
+
+            options = [
+                normalize(x)
+                for x in select.locator(
+                    "option"
+                ).all_inner_texts()
+            ]
+
+            joined = " | ".join(
+                options
+            ).lower()
+
+            # Application categories visible
+            # in the screenshot/user page
+            indicators = [
+                "passport",
+                "mvv",
+                "legalisation",
+                "certificate of life",
+                "identity card",
+                "copy conform original",
+                "signature",
+            ]
+
+            score = sum(
+                x in joined
+                for x in indicators
+            )
+
+            if score >= 1:
+
+                print(
+                    "[info] Application Category "
+                    "SELECT found."
+                )
+
+                return {
+                    "type": "select",
+                    "locator": select,
+                }
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # ASP.NET / custom dropdown fallback
+    # --------------------------------------------------------
+
+    candidates = page.locator(
+        "input:visible, "
+        "button:visible, "
+        "[role='combobox']:visible, "
+        "[role='listbox']:visible"
+    )
+
+    for i in range(
+        candidates.count()
+    ):
+
+        element = candidates.nth(i)
+
+        try:
+
+            text = lower(
+                element.inner_text()
+                or element.get_attribute(
+                    "aria-label"
+                )
+                or element.get_attribute(
+                    "title"
+                )
+                or element.get_attribute(
+                    "name"
+                )
+                or element.get_attribute(
+                    "id"
+                )
+            )
+
+            if (
+                "application category"
+                in text
+                or "category"
+                in text
+            ):
+
+                print(
+                    "[info] Custom "
+                    "Application Category "
+                    "control found."
+                )
+
+                return {
+                    "type": "custom",
+                    "locator": element,
+                }
+
+        except Exception:
+            continue
+
+    # Save complete page
+    save_debug(
+        page,
+        "ERROR_application_category_not_found"
+    )
+
+    raise RuntimeError(
+        "Application Category control "
+        "was not found after "
+        "Make an appointment."
+    )
+
+
+# ============================================================
+# GET CATEGORIES
+# ============================================================
+
+def get_categories(page):
+
+    control = find_category_controls(
+        page
+    )
+
+    if control["type"] != "select":
+
+        raise RuntimeError(
+            "The Application Category is "
+            "a custom control. "
+            "A screenshot/HTML was saved "
+            "for selector adjustment."
+        )
+
+    select = control["locator"]
+
+    options = select.locator(
+        "option"
+    )
+
+    categories = []
+
+    for i in range(
+        options.count()
+    ):
+
+        option = options.nth(i)
+
+        try:
+
+            text = normalize(
+                option.inner_text()
+            )
+
+            value = (
+                option.get_attribute(
+                    "value"
+                )
+                or ""
+            )
+
+            disabled = (
+                option.is_disabled()
+            )
+
+            if disabled:
+                continue
+
+            if not text:
+                continue
+
+            if lower(text) in {
+                "select",
+                "-select-",
+                "--select--",
+                "- select -",
+            }:
+                continue
+
+            categories.append({
+                "text": text,
+                "value": value,
+            })
+
+        except Exception:
+            continue
+
+    # De-duplicate
+    result = []
+    seen = set()
+
+    for category in categories:
+
+        key = (
+            category["text"],
+            category["value"]
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(
+            category
+        )
+
+    print(
+        f"[info] Found "
+        f"{len(result)} Application Categories."
+    )
+
+    for i, category in enumerate(
+        result,
+        1
+    ):
+        print(
+            f"[category {i}] "
+            f"{category['text']}"
+        )
+
+    if not result:
+
+        raise RuntimeError(
+            "Application Category exists "
+            "but contains no usable options."
+        )
+
+    return result
+
+
+# ============================================================
+# CONTINUE
+# ============================================================
+
+def click_continue(page):
+
+    print(
+        "[info] Looking for Continue..."
+    )
 
     locators = [
 
@@ -513,119 +824,128 @@ def click_continue(page) -> None:
             )
         ),
 
+        page.get_by_text(
+            "Continue",
+            exact=True
+        ),
     ]
 
     for locator in locators:
 
         try:
 
-            if locator.count():
+            count = locator.count()
 
-                locator.first.click(
-                    timeout=10000
+            for i in range(count):
+
+                element = locator.nth(i)
+
+                if not element.is_visible():
+                    continue
+
+                element.click(
+                    timeout=15000
                 )
 
-                return
-
-        except Exception:
-            pass
-
-    # Fallback
-    buttons = page.locator(
-        "input:visible, "
-        "button:visible, "
-        "a:visible"
-    )
-
-    for i in range(buttons.count()):
-
-        el = buttons.nth(i)
-
-        try:
-
-            txt = normalize(
-                el.inner_text()
-                or el.get_attribute("value")
-                or ""
-            )
-
-            if txt == "continue":
-
-                el.click(
-                    timeout=10000
-                )
+                wait_page(page)
 
                 return
 
         except Exception:
             continue
 
+    # Input fallback
+    elements = page.locator(
+        "input:visible, "
+        "button:visible, "
+        "a:visible"
+    )
+
+    for i in range(
+        elements.count()
+    ):
+
+        element = elements.nth(i)
+
+        try:
+
+            text = lower(
+                element.inner_text()
+                or element.get_attribute(
+                    "value"
+                )
+                or element.get_attribute(
+                    "aria-label"
+                )
+            )
+
+            if text == "continue":
+
+                element.click(
+                    timeout=15000
+                )
+
+                wait_page(page)
+
+                return
+
+        except Exception:
+            continue
+
+    save_debug(
+        page,
+        "ERROR_continue_not_found"
+    )
+
     raise RuntimeError(
-        "Could not find the Continue control."
+        "Continue button was not found."
     )
 
 
 # ============================================================
-# CLASSIFY RESULT
+# CHECK APPOINTMENT RESULT
 # ============================================================
 
-def classify_result(page) -> Tuple[str, str]:
+def check_result(page):
 
-    """
-    Returns:
+    text = lower(
+        get_body_text(page)
+    )
 
-        unavailable
-        available
-        unknown
-    """
+    # Explicit no slots
+    for pattern in NO_SLOT_TEXT:
 
-    text = page_text(page)
-
-    # Explicit no-slot message
-    for pattern in NO_SLOT_PATTERNS:
-
-        if re.search(
-            pattern,
-            text,
-            re.I
-        ):
+        if pattern in text:
 
             return (
                 "unavailable",
-                f"matched: {pattern}"
+                pattern
             )
 
-    # Appointment info page
-    current_url = page.url.lower()
-
+    # Appointment information page
     if (
-        "appschedulinggetinfo.aspx"
-        in current_url
+        "appschedulinggetinfo"
+        in page.url.lower()
     ):
 
         return (
             "available",
-            f"appointment info page: {page.url}"
+            "appointment information page"
         )
 
-    # Positive signals
-    for pattern in POSITIVE_PATTERNS:
+    # Positive indicators
+    for pattern in AVAILABLE_TEXT:
 
-        if re.search(
-            pattern,
-            text,
-            re.I
-        ):
+        if pattern in text:
 
             return (
                 "available",
-                f"matched positive signal: {pattern}"
+                pattern
             )
 
     return (
         "unknown",
-        "Neither explicit no-slot message "
-        "nor positive appointment signal was found"
+        "No known appointment state detected"
     )
 
 
@@ -633,236 +953,171 @@ def classify_result(page) -> Tuple[str, str]:
 # CHECK ONE CATEGORY
 # ============================================================
 
-def inspect_category(
+def check_category(
     context,
-    category: Dict[str, str],
-    index: int,
-    total: int
-) -> Dict:
+    category,
+    index,
+    total
+):
 
     page = context.new_page()
 
     page.set_default_timeout(
-        PAGE_TIMEOUT_MS
+        PAGE_TIMEOUT
     )
 
     try:
 
+        print()
+        print(
+            "=" * 60
+        )
+
         print(
             f"[{index}/{total}] "
-            f"Checking: {category['text']}",
-            flush=True
+            f"{category['text']}"
         )
 
-        # ----------------------------------------------------
-        # Open fresh session/page
-        # ----------------------------------------------------
+        print(
+            "=" * 60
+        )
 
+        # Fresh page
         page.goto(
-            BASE_URL,
+            URL,
             wait_until="domcontentloaded",
-            timeout=PAGE_TIMEOUT_MS
+            timeout=PAGE_TIMEOUT
         )
 
-        try:
+        wait_page(page)
 
-            page.wait_for_load_state(
-                "networkidle",
-                timeout=15000
-            )
-
-        except PlaywrightTimeoutError:
-            pass
-
-        # ----------------------------------------------------
-        # Set applicants
-        # ----------------------------------------------------
-
-        set_applicants(page)
-
-        # ----------------------------------------------------
-        # Find category dropdown
-        # ----------------------------------------------------
-
-        sel = find_category_select(
+        # IMPORTANT:
+        # The original code failed because it searched
+        # for Application Category on the welcome page.
+        click_make_appointment(
             page
         )
 
-        # ----------------------------------------------------
-        # Select category
-        # ----------------------------------------------------
+        set_applicants(
+            page
+        )
 
+        control = find_category_controls(
+            page
+        )
+
+        if control["type"] != "select":
+
+            save_debug(
+                page,
+                "CUSTOM_CATEGORY",
+                category["text"]
+            )
+
+            raise RuntimeError(
+                "Category control is custom."
+            )
+
+        select = control["locator"]
+
+        # Select by VALUE whenever possible
         if category["value"]:
 
-            sel.select_option(
+            select.select_option(
                 value=category["value"]
             )
 
         else:
 
-            sel.select_option(
+            select.select_option(
                 label=category["text"]
             )
 
-        # ----------------------------------------------------
-        # Continue
-        # ----------------------------------------------------
-
-        click_continue(page)
-
-        # ----------------------------------------------------
-        # Wait for ASP.NET postback
-        # ----------------------------------------------------
-
-        try:
-
-            page.wait_for_load_state(
-                "domcontentloaded",
-                timeout=20000
-            )
-
-        except PlaywrightTimeoutError:
-            pass
-
-        try:
-
-            page.wait_for_load_state(
-                "networkidle",
-                timeout=10000
-            )
-
-        except PlaywrightTimeoutError:
-            pass
-
-        # Short stabilization delay
-        page.wait_for_timeout(
-            1500
+        print(
+            f"[info] Selected: "
+            f"{category['text']}"
         )
 
-        # ----------------------------------------------------
-        # Detect appointment state
-        # ----------------------------------------------------
-
-        result, reason = classify_result(
+        click_continue(
             page
         )
 
-        # ----------------------------------------------------
-        # Unknown state
-        # ----------------------------------------------------
+        result, reason = check_result(
+            page
+        )
 
-        if result == "unknown":
-
-            png, html = save_debug(
-                page,
-                "unknown_state",
-                category["text"]
-            )
+        if result == "unavailable":
 
             print(
-                f"[warn] UNKNOWN state for "
-                f"{category['text']}",
-                flush=True
+                f"[OK] NO SLOT: "
+                f"{category['text']}"
             )
-
-            print(
-                f"[warn] Screenshot: {png}",
-                flush=True
-            )
-
-            print(
-                f"[warn] HTML: {html}",
-                flush=True
-            )
-
-        # ----------------------------------------------------
-        # Possible availability
-        # ----------------------------------------------------
 
         elif result == "available":
 
-            png, html = save_debug(
+            print(
+                f"[!!!] POSSIBLE SLOT: "
+                f"{category['text']}"
+            )
+
+            print(
+                f"[!!!] Reason: {reason}"
+            )
+
+            save_debug(
                 page,
                 "AVAILABLE",
                 category["text"]
             )
 
-            print(
-                f"[ALERT] POSSIBLE AVAILABILITY: "
-                f"{category['text']}",
-                flush=True
-            )
-
-            print(
-                f"[ALERT] Reason: {reason}",
-                flush=True
-            )
-
-            print(
-                f"[ALERT] Screenshot: {png}",
-                flush=True
-            )
-
-        # ----------------------------------------------------
-        # No appointment
-        # ----------------------------------------------------
-
         else:
 
             print(
-                f"[ok] No availability: "
-                f"{category['text']} | {reason}",
-                flush=True
+                f"[UNKNOWN] "
+                f"{category['text']}"
+            )
+
+            print(
+                f"[UNKNOWN] {reason}"
+            )
+
+            save_debug(
+                page,
+                "UNKNOWN",
+                category["text"]
             )
 
         return {
             "status": result,
             "reason": reason,
             "url": page.url,
-            "checked_at": now_iso(),
+            "checked_at": timestamp(),
         }
 
-    except PlaywrightTimeoutError as exc:
+    except Exception as e:
 
-        png, html = save_debug(
+        print(
+            f"[ERROR] "
+            f"{category['text']}: {e}"
+        )
+
+        save_debug(
             page,
-            "timeout",
+            "ERROR",
             category["text"]
         )
 
         return {
             "status": "error",
-            "reason": f"timeout: {exc}",
+            "reason": str(e),
             "url": page.url,
-            "checked_at": now_iso(),
-            "png": str(png),
-            "html": str(html),
-        }
-
-    except Exception as exc:
-
-        png, html = save_debug(
-            page,
-            "error",
-            category["text"]
-        )
-
-        return {
-            "status": "error",
-            "reason": (
-                f"{type(exc).__name__}: {exc}"
-            ),
-            "url": page.url,
-            "checked_at": now_iso(),
-            "png": str(png),
-            "html": str(html),
+            "checked_at": timestamp(),
         }
 
     finally:
 
         try:
             page.close()
-
         except Exception:
             pass
 
@@ -872,45 +1127,74 @@ def inspect_category(
 # ============================================================
 
 def send_email(
-    subject: str,
-    body: str
-) -> None:
+    categories
+):
 
-    user = os.environ.get(
+    gmail_user = os.getenv(
         "GMAIL_USER",
         ""
     ).strip()
 
-    password = os.environ.get(
+    gmail_password = os.getenv(
         "GMAIL_APP_PASSWORD",
         ""
     ).strip()
 
-    recipient = os.environ.get(
+    notify_email = os.getenv(
         "NOTIFY_EMAIL",
         ""
     ).strip()
 
-    if (
-        not user
-        or not password
-        or not recipient
-    ):
+    if not all([
+        gmail_user,
+        gmail_password,
+        notify_email,
+    ]):
 
-        raise RuntimeError(
-            "Email secrets missing. "
-            "Set GMAIL_USER, "
-            "GMAIL_APP_PASSWORD and "
-            "NOTIFY_EMAIL."
+        print(
+            "[warn] Email secrets are missing."
         )
 
-    msg = EmailMessage()
+        return
 
-    msg["From"] = user
-    msg["To"] = recipient
-    msg["Subject"] = subject
+    message = EmailMessage()
 
-    msg.set_content(body)
+    message["From"] = gmail_user
+    message["To"] = notify_email
+
+    message["Subject"] = (
+        "🇳🇱 Netherlands VFS "
+        "Appointment Available"
+    )
+
+    body = [
+        "Netherlands VFS appointment "
+        "monitor detected possible availability.",
+        "",
+    ]
+
+    for item in categories:
+
+        body.extend([
+            f"Category: "
+            f"{item['category']}",
+
+            f"Reason: "
+            f"{item['reason']}",
+
+            f"URL: "
+            f"{item['url']}",
+
+            "",
+        ])
+
+    body.append(
+        "The monitor did NOT book an appointment."
+    )
+
+    message.set_content(
+        "\n".join(body)
+    )
 
     with smtplib.SMTP(
         "smtp.gmail.com",
@@ -921,22 +1205,26 @@ def send_email(
         smtp.starttls()
 
         smtp.login(
-            user,
-            password
+            gmail_user,
+            gmail_password
         )
 
         smtp.send_message(
-            msg
+            message
         )
 
+    print(
+        "[ALERT] Email sent."
+    )
+
 
 # ============================================================
-# ONE MONITORING CYCLE
+# RUN ONE COMPLETE CYCLE
 # ============================================================
 
-def run_once() -> bool:
+def run_once():
 
-    if not BASE_URL:
+    if not URL:
 
         raise RuntimeError(
             "NL_APPOINTMENT_URL is not set."
@@ -949,21 +1237,16 @@ def run_once() -> bool:
         {}
     )
 
+    available = []
+
     with sync_playwright() as p:
 
-        # ----------------------------------------------------
-        # Launch Chromium
-        # ----------------------------------------------------
-
         browser = p.chromium.launch(
-
             headless=HEADLESS,
-
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-            ],
+            ]
         )
 
         context = browser.new_context(
@@ -976,154 +1259,82 @@ def run_once() -> bool:
             locale="en-US",
 
             timezone_id="Africa/Cairo",
-
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/151.0.0.0 "
-                "Safari/537.36"
-            ),
         )
+
+        # ----------------------------------------------------
+        # FIRST PAGE:
+        # Discover categories after clicking Make appointment
+        # ----------------------------------------------------
 
         page = context.new_page()
 
         page.set_default_timeout(
-            PAGE_TIMEOUT_MS
+            PAGE_TIMEOUT
         )
-
-        # ----------------------------------------------------
-        # Discover categories
-        # ----------------------------------------------------
 
         try:
 
-            print(
-                f"[info] Opening: {BASE_URL}",
-                flush=True
-            )
-
-            page.goto(
-                BASE_URL,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT_MS
-            )
-
-            try:
-
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=15000
-                )
-
-            except PlaywrightTimeoutError:
-                pass
-
-            # ------------------------------------------------
-            # Anti-bot / CAPTCHA detection
-            # ------------------------------------------------
-
-            initial_text = page_text(
+            open_start_page(
                 page
             )
 
-            challenge_terms = [
-                "captcha",
-                "verify you are human",
-                "checking your browser",
-                "access denied",
-            ]
-
-            if any(
-                term in initial_text
-                for term in challenge_terms
-            ):
-
-                save_debug(
-                    page,
-                    "challenge"
-                )
-
-                raise RuntimeError(
-                    "The site presented a CAPTCHA/"
-                    "anti-bot/challenge page. "
-                    "The monitor stops instead of "
-                    "attempting to bypass it."
-                )
-
-            # ------------------------------------------------
-            # Discover all categories
-            # ------------------------------------------------
-
-            categories = (
-                discover_categories(
-                    page
-                )
+            click_make_appointment(
+                page
             )
 
-            print(
-                f"[info] Discovered "
-                f"{len(categories)} categories.",
-                flush=True
+            set_applicants(
+                page
             )
 
-            # ------------------------------------------------
-            # Save category list
-            # ------------------------------------------------
-
-            ARTIFACT_DIR.mkdir(
-                parents=True,
-                exist_ok=True
+            categories = get_categories(
+                page
             )
-
-            (
-                ARTIFACT_DIR
-                / "categories.json"
-            ).write_text(
-
-                json.dumps(
-                    categories,
-                    ensure_ascii=False,
-                    indent=2
-                ),
-
-                encoding="utf-8"
-            )
-
-        except Exception:
-
-            save_debug(
-                page,
-                "startup_error"
-            )
-
-            raise
 
         finally:
 
             try:
                 page.close()
-
             except Exception:
                 pass
+
+        # Save categories
+        DEBUG_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        (
+            DEBUG_DIR
+            / "categories.json"
+        ).write_text(
+
+            json.dumps(
+                categories,
+                ensure_ascii=False,
+                indent=2
+            ),
+
+            encoding="utf-8"
+        )
 
         # ----------------------------------------------------
         # Check every category
         # ----------------------------------------------------
 
-        alerts = []
+        total = len(
+            categories
+        )
 
-        for idx, category in enumerate(
+        for index, category in enumerate(
             categories,
-            start=1
+            1
         ):
 
-            result = inspect_category(
+            result = check_category(
                 context,
                 category,
-                idx,
-                len(categories)
+                index,
+                total
             )
 
             key = (
@@ -1137,7 +1348,9 @@ def run_once() -> bool:
             )
 
             previous_status = (
-                previous.get("status")
+                previous.get(
+                    "status"
+                )
             )
 
             state["categories"][key] = {
@@ -1145,10 +1358,8 @@ def run_once() -> bool:
                 **result,
             }
 
-            # ------------------------------------------------
-            # Alert only when status becomes available
-            # ------------------------------------------------
-
+            # Alert only when changing into
+            # available state.
             if (
                 result["status"]
                 == "available"
@@ -1156,104 +1367,79 @@ def run_once() -> bool:
                 != "available"
             ):
 
-                alerts.append(
-                    (
-                        category,
-                        result
-                    )
-                )
+                available.append({
+                    "category":
+                        category["text"],
+
+                    "reason":
+                        result["reason"],
+
+                    "url":
+                        result["url"],
+                })
 
             save_state(
                 state
             )
 
             time.sleep(
-                CATEGORY_DELAY_SECONDS
+                CATEGORY_DELAY
             )
 
         browser.close()
 
-    # --------------------------------------------------------
-    # Save cycle timestamp
-    # --------------------------------------------------------
-
-    state["last_run"] = now_iso()
+    state["last_run"] = timestamp()
 
     save_state(
         state
     )
 
     # --------------------------------------------------------
-    # Send alert
+    # Email
     # --------------------------------------------------------
 
-    if alerts:
-
-        lines = [
-            "Netherlands VFS appointment "
-            "monitor detected possible availability.",
-            "",
-        ]
-
-        for category, result in alerts:
-
-            lines.extend(
-                [
-                    f"Category: "
-                    f"{category['text']}",
-
-                    f"URL: "
-                    f"{result.get('url', BASE_URL)}",
-
-                    f"Reason: "
-                    f"{result.get('reason', '')}",
-
-                    f"Detected: "
-                    f"{result.get('checked_at', now_iso())}",
-
-                    "",
-                ]
-            )
-
-        lines.append(
-            "No appointment was booked automatically."
-        )
+    if available:
 
         send_email(
-
-            subject=(
-                "🇳🇱 Netherlands VFS — "
-                "Possible appointment available"
-            ),
-
-            body="\n".join(lines),
+            available
         )
 
-        print(
-            f"[alert] Email sent for "
-            f"{len(alerts)} category/categories.",
-            flush=True
-        )
+    print()
+    print(
+        "=" * 60
+    )
 
-    return bool(alerts)
+    print(
+        "[DONE] Netherlands monitoring cycle completed."
+    )
+
+    print(
+        f"[DONE] Categories checked: {len(categories)}"
+    )
+
+    print(
+        f"[DONE] Possible available: {len(available)}"
+    )
+
+    print(
+        "=" * 60
+    )
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main() -> int:
+def main():
 
     try:
 
-        # Single cycle
         if "--once" in sys.argv:
 
             run_once()
 
             return 0
 
-        # Continuous mode
         while True:
 
             started = time.time()
@@ -1262,12 +1448,10 @@ def main() -> int:
 
                 run_once()
 
-            except Exception as exc:
+            except Exception as e:
 
                 print(
-                    f"[fatal] "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True
+                    f"[FATAL] {type(e).__name__}: {e}"
                 )
 
                 return 1
@@ -1277,37 +1461,28 @@ def main() -> int:
                 - started
             )
 
-            wait_for = max(
-                10,
-                POLL_SECONDS
-                - int(elapsed)
+            wait = max(
+                30,
+                300 - int(elapsed)
             )
 
             print(
-                f"[info] Cycle finished "
-                f"in {elapsed:.1f}s. "
-                f"Next cycle in "
-                f"{wait_for}s.",
-                flush=True
+                f"[INFO] Next check "
+                f"in {wait} seconds."
             )
 
             time.sleep(
-                wait_for
+                wait
             )
 
     except KeyboardInterrupt:
 
         print(
-            "[info] Stopped.",
-            flush=True
+            "[INFO] Stopped."
         )
 
         return 0
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
 
